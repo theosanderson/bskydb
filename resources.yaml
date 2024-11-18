@@ -1,0 +1,307 @@
+# configmaps.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: bluesky
+data:
+  POSTGRES_DB: bluesky_posts
+  POSTGRES_PASSWORD: dev-password-123  # Since DB isn't exposed, we can use a simple password
+  init.sql: |
+    CREATE TABLE IF NOT EXISTS posts (
+      id SERIAL PRIMARY KEY,
+      message_id TEXT NOT NULL UNIQUE, 
+      did TEXT NOT NULL,
+      post_text TEXT,
+      timestamp_us BIGINT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_timestamp ON posts(created_at);
+    CREATE INDEX IF NOT EXISTS idx_message_id ON posts(message_id);
+    
+    CREATE OR REPLACE FUNCTION cleanup_old_posts()
+    RETURNS void AS $$
+    BEGIN
+      DELETE FROM posts 
+      WHERE created_at < NOW() - INTERVAL '24 hours';
+    END;
+    $$ LANGUAGE plpgsql;
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: populator-script
+  namespace: bluesky
+data:
+  package.json: |
+    {
+      "name": "bluesky-db-populator",
+      "version": "1.0.0",
+      "dependencies": {
+        "ws": "^8.13.0",
+        "pg": "^8.11.0",
+        "pino": "^8.14.1"
+      }
+    }
+  index.js: |
+    const WebSocket = require('ws');
+    const { Pool } = require('pg');
+    const pino = require('pino');
+
+    const logger = pino({
+      level: 'info',
+      timestamp: () => `,"time":"${new Date().toISOString()}"`,
+    });
+
+    const pool = new Pool({
+      user: 'postgres',
+      host: 'postgres',
+      database: process.env.POSTGRES_DB,
+      password: process.env.POSTGRES_PASSWORD,
+      port: 5432,
+    });
+
+    const insertPostQuery = `
+      INSERT INTO posts (message_id, did, post_text, timestamp_us)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (message_id) DO NOTHING
+    `;
+
+    async function connectToDatabase() {
+      try {
+        await pool.query('SELECT NOW()');
+        logger.info('Successfully connected to PostgreSQL');
+      } catch (err) {
+        logger.error({ err }, 'Failed to connect to PostgreSQL');
+        process.exit(1);
+      }
+    }
+
+    async function insertPost(messageId, did, text, timeUs) {
+      try {
+        await pool.query(insertPostQuery, [messageId, did, text, timeUs]);
+        logger.debug({ messageId }, 'Successfully inserted post');
+      } catch (err) {
+        logger.error({ err, messageId }, 'Failed to insert post');
+      }
+    }
+
+    function connectToBlueskyFirehose() {
+      const ws = new WebSocket('wss://bsky-relay.c.theo.io/subscribe?wantedCollections=app.bsky.feed.post');
+
+      ws.on('open', () => {
+        logger.info('Connected to Bluesky firehose');
+      });
+
+      ws.on('message', async (data) => {
+        try {
+          const message = JSON.parse(data);
+          
+          if (message.commit?.record?.text && 
+              message.commit?.operation === 'create' && 
+              message.commit?.collection === 'app.bsky.feed.post') {
+            
+            const messageId = message.commit.rkey;
+            const did = message.did;
+            const text = message.commit.record.text;
+            const timeUs = message.time_us;
+
+            await insertPost(messageId, did, text, timeUs);
+          }
+        } catch (err) {
+          logger.error({ err }, 'Error processing message');
+        }
+      });
+
+      ws.on('error', (error) => {
+        logger.error({ error }, 'WebSocket error');
+      });
+
+      ws.on('close', () => {
+        logger.warn('Disconnected from Bluesky firehose, attempting to reconnect in 5 seconds...');
+        setTimeout(connectToBlueskyFirehose, 5000);
+      });
+    }
+
+    async function main() {
+      await connectToDatabase();
+      connectToBlueskyFirehose();
+    }
+
+    main().catch((err) => {
+      logger.error({ err }, 'Application failed to start');
+      process.exit(1);
+    });
+
+---
+# postgres infrastructure
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: bluesky
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: bluesky
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: POSTGRES_DB
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata  # Changed this line
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+            - name: init-script
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+        - name: init-script
+          configMap:
+            name: postgres-config
+            items:
+              - key: init.sql
+                path: init.sql
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: bluesky
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP
+
+---
+# cleanup job
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-cleanup
+  namespace: bluesky
+spec:
+  schedule: "0 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: postgres-cleanup
+              image: postgres:15
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  PGPASSWORD=$POSTGRES_PASSWORD psql -h postgres -U postgres -d bluesky_posts -c "SELECT cleanup_old_posts();"
+              env:
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    configMapKeyRef:
+                      name: postgres-config
+                      key: POSTGRES_PASSWORD
+          restartPolicy: OnFailure
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bluesky-populator
+  namespace: bluesky
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bluesky-populator
+  template:
+    metadata:
+      labels:
+        app: bluesky-populator
+    spec:
+      initContainers:
+        - name: install-deps
+          image: node:18-slim
+          command: 
+            - /bin/sh
+            - -c
+            - |
+              cp /config/* /app/
+              cd /app
+              npm install
+          volumeMounts:
+            - name: script-volume
+              mountPath: /config
+            - name: app-volume
+              mountPath: /app
+      containers:
+        - name: populator
+          image: node:18-slim
+          command: ['node', 'index.js']
+          workingDir: /app
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: POSTGRES_DB
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: POSTGRES_PASSWORD
+          volumeMounts:
+            - name: app-volume
+              mountPath: /app
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+      volumes:
+        - name: script-volume
+          configMap:
+            name: populator-script
+        - name: app-volume
+          emptyDir: {}
