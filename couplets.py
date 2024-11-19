@@ -11,6 +11,85 @@ import re
 from atproto import Client, models
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, Iterator
+import time
+
+import re
+from collections import defaultdict
+from itertools import product
+from functools import lru_cache
+
+# Load NLTK's CMU Pronouncing Dictionary
+pronouncing_dict = cmudict.dict()
+
+# Precompute stress patterns for each word
+word_stress_patterns = defaultdict(list)
+for word, pronunciations in pronouncing_dict.items():
+    word_stress_patterns[word] = [
+        [int(phoneme[-1]) for phoneme in pron if phoneme[-1].isdigit()]
+        for pron in pronunciations
+    ]
+
+# Helper to convert numbers to words
+def num2words(num):
+    under_20 = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+                'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen',
+                'eighteen', 'nineteen']
+    tens = ['twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety']
+    above_100 = {100: 'hundred', 1000: 'thousand'}
+
+    if num < 20:
+        return under_20[num]
+    if num < 100:
+        return tens[(num // 10) - 2] + ('' if num % 10 == 0 else ' ' + under_20[num % 10])
+    pivot = max([key for key in above_100.keys() if key <= num])
+    return num2words(num // pivot) + ' ' + above_100[pivot] + ('' if num % pivot == 0 else ' ' + num2words(num % pivot))
+
+# Normalize text
+def normalize_text(text):
+    substitutions = {'&': ' and ', 'w/': 'with', 'w/o': 'without'}
+    for k, v in substitutions.items():
+        text = text.replace(k, v)
+    text = re.sub(r'\d+', lambda m: num2words(int(m.group())), text)
+    text = re.sub(r'[^a-zA-Z\s\']', '', text)
+    return re.sub(r'\s+', ' ', text.strip().lower())
+
+# Check if a stress pattern conforms to iambic pentameter
+def is_iambic_pentameter(pattern):
+    return len(pattern) == 10 and all(
+        (stress == 0) if i % 2 == 0 else (stress == 1)
+        for i, stress in enumerate(pattern)
+    )
+
+# Main function to check if text is in iambic pentameter
+@lru_cache(maxsize=1000)
+def check_iambic_pentameter(raw_text):
+    text = normalize_text(raw_text)
+    words = text.split()
+    
+    if not words or any(word not in word_stress_patterns for word in words):
+        return False
+    
+    stress_combinations = [word_stress_patterns[word] for word in words]
+    all_stress = product(*stress_combinations)
+
+   
+    found_iambic = False
+    patterns_checked = 0
+    for combination in all_stress:
+        pattern = [stress for stresses in combination for stress in stresses]
+        patterns_checked += 1
+        
+        if is_iambic_pentameter(pattern):
+            found_iambic = True
+        
+
+    # if checked too many patterns, return False
+    if patterns_checked > 24:
+        return False
+    return found_iambic
+
+
+
 
 # Configure logging
 logging.basicConfig(
@@ -133,14 +212,56 @@ class IambicRhymeFinder:
                 result = cur.fetchone()
                 return result[0] if result else datetime.min
 
+    def update_repost_timestamp(self, post: BlueskyPost):
+        """Update the repost timestamp for a post in the database."""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                query = """
+                    UPDATE iambic_messages
+                    SET reposted_at = NOW()
+                    WHERE id = %s
+                """
+
+                cur.execute(query, (post.id,))
+                conn.commit()
+                print(f"Updated repost timestamp for post {post.uri}")
+               
+    def repost_post(self, post: BlueskyPost):
+        """Repost a single post and update its timestamp."""
+        try:
+            # Get post details from API to get CID
+            post_details = self.client.app.bsky.feed.get_posts({'uris': [post.uri]}).posts[0]
+            # Repost using simplified client method
+            self.client.repost(uri=post.uri, cid=post_details.cid)
+            print(f"Reposting post: {post.uri}")
+            self.update_repost_timestamp(post)
+            logging.info(f"Successfully reposted post: {post.uri}")
+        except Exception as e:
+            logging.error(f"Failed to repost {post.uri}: {e}")
+            raise
+
+    def repost_couplet(self, couplet: RhymingCouplet):
+        """Repost both posts in chronological order."""
+        # Get posts in chronological order
+        posts = sorted([couplet.first_post, couplet.second_post], 
+                      key=lambda x: x.created_at)
+        
+        # Repost older post first
+        self.repost_post(posts[0])
+        time.sleep(2)  # Brief pause between reposts
+        # Repost newer post
+        self.repost_post(posts[1])
+
     def get_new_messages(self, last_timestamp: datetime) -> Iterator[BlueskyPost]:
         """Get all messages since the last reposted timestamp as BlueskyPost objects."""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
+               
                 query = """
                     SELECT id, message_id, post_text, created_at, did
                     FROM iambic_messages
                     WHERE created_at > %s
+                    AND created_at < NOW() - INTERVAL '1 hour'
                     ORDER BY created_at ASC
                 """
                 cur.execute(query, (last_timestamp,))
@@ -163,17 +284,21 @@ class IambicRhymeFinder:
         - No link cards
         - No links in text
         """
-        logging.info(post.indexed_at)
-        logging.info(post.record.created_at)
-        # if created at at indexed at are more than 1 day apart in either direction, skip (they are strs like 2024-11-19T17:46:18.552Z)
-        indexed_at_unix_timestamp = datetime.strptime(post.indexed_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
-        created_at_unix_timestamp = datetime.strptime(post.record.created_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
-        if abs(indexed_at_unix_timestamp - created_at_unix_timestamp) > 86400:
+        try:
+            logging.info(post.indexed_at)
+            logging.info(post.record.created_at)
+            # if created at at indexed at are more than 1 day apart in either direction, skip
+            indexed_at_unix_timestamp = datetime.strptime(post.indexed_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+            created_at_unix_timestamp = datetime.strptime(post.record.created_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+            if abs(indexed_at_unix_timestamp - created_at_unix_timestamp) > 86400:
+                return False
+            if post.embed != None:
+                return False
+            
+            return True
+        except Exception as e:
+            logging.error(f"Error validating post: {e}")
             return False
-        if post.embed != None:
-            return False
-        
-        return True
 
     def fetch_valid_posts(self, posts: List[BlueskyPost]) -> List[BlueskyPost]:
         """Fetch and validate posts from Bluesky API"""
@@ -212,9 +337,21 @@ class IambicRhymeFinder:
         messages = list(self.get_new_messages(last_timestamp))
         logging.info(f"Found {len(messages)} new messages to analyze")
 
+        # Filter out messages that are not in iambic pentameter, logging those excluded
+        old_messages = messages
+        messages = []
+        for message in old_messages:
+            if check_iambic_pentameter(message.post_text):
+                messages.append(message)
+            else:
+                logging.info(f"Filtered out message: {message.post_text}")
+
+
         # Fetch and validate posts
         valid_messages = self.fetch_valid_posts(messages)
         logging.info(f"After filtering, {len(valid_messages)} valid messages remain")
+        for message in valid_messages:
+            logging.info(f"Valid message: {message.post_text}")
 
         # Find rhyming couplets
         couplets = []
@@ -262,3 +399,10 @@ if __name__ == "__main__":
         print(f"2: {oldest_recent_couplet.second_post.post_text}")
         print(f"Posted: {oldest_recent_couplet.first_post.created_at} and {oldest_recent_couplet.second_post.created_at}")
         print(f"Message IDs: {oldest_recent_couplet.first_post.message_id} and {oldest_recent_couplet.second_post.message_id}")
+        #raise Exception("Test")
+        # Repost the couplet in chronological order
+        try:
+            finder.repost_couplet(oldest_recent_couplet)
+            print("Successfully reposted couplet in chronological order!")
+        except Exception as e:
+            print(f"Failed to repost couplet: {e}")
