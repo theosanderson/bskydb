@@ -377,7 +377,7 @@ data:
     def is_iambic_pentameter(pattern):
         """Check if a stress pattern is iambic pentameter."""
         return len(pattern) == 10 and all(
-            (s == 0 or s == 2) if i % 2 == 0 else s == 1
+            (s == 0 ) if i % 2 == 0 else s == 1
             for i, s in enumerate(pattern)
         )
 
@@ -736,6 +736,9 @@ data:
     def check_iambic_pentameter(raw_text):
         text = normalize_text(raw_text)
         words = text.split()
+
+        if '\n' in text:
+            return False
         
         if not words or any(word not in word_stress_patterns for word in words):
             return False
