@@ -8,6 +8,9 @@ from nltk.corpus import cmudict
 from collections import defaultdict
 import itertools
 import re
+from atproto import Client, models
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Tuple, Iterator
 
 # Configure logging
 logging.basicConfig(
@@ -19,41 +22,50 @@ logging.basicConfig(
 nltk.download('cmudict', quiet=True)
 pronouncing_dict = cmudict.dict()
 
-# Reuse the text processing utilities from the monitor
-substitutions = {
-    '&': ' and ',
-    'w/': 'with',
-    'w/o': 'without',
-}
+@dataclass
+class BlueskyPost:
+    """Represents a post from the database"""
+    id: int
+    message_id: str
+    post_text: str
+    created_at: datetime
+    did: str
+    reposted_at: Optional[datetime] = None
+    
+    @property
+    def uri(self) -> str:
+        """Generate the at:// URI for the post"""
+        feed_type = "app.bsky.feed.post"
+        result= f"at://{self.did}/{feed_type}/{self.message_id}"
+        
+        return result
+        
+    @property
+    def last_word(self) -> Optional[str]:
+        """Get the last word of the post text"""
+        return get_last_word(self.post_text)
 
-banned = ['$', '#', '@', '/']
-
-def num2words(num):
-    """Convert number to words."""
-    under_20 = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven',
-                'Eight', 'Nine', 'Ten', 'Eleven', 'Twelve', 'Thirteen', 'Fourteen',
-                'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen']
-    tens = ['Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seventy', 'Eighty', 'Ninety']
-    above_100 = {100: 'Hundred', 1000: 'Thousand', 1000000: 'Million', 1000000000: 'Billion'}
-
-    if num < 20:
-        return under_20[num]
-    if num < 100:
-        return tens[(num // 10) - 2] + ('' if num % 10 == 0 else ' ' + under_20[num % 10])
-    pivot = max([key for key in above_100.keys() if key <= num])
-    return num2words(num // pivot) + ' ' + above_100[pivot] + ('' if num % pivot == 0 else ' ' + num2words(num % pivot))
-
-def numerals_to_words(text):
-    """Convert numerals to words in text."""
-    return re.sub(r'(\d+)', lambda m: num2words(int(m.group(0))), text)
+@dataclass
+class RhymingCouplet:
+    """Represents a pair of rhyming posts"""
+    first_post: BlueskyPost
+    second_post: BlueskyPost
+    
+    @property
+    def time_difference(self) -> float:
+        """Get time difference between posts in seconds"""
+        return abs((self.first_post.created_at - self.second_post.created_at).total_seconds())
+    
+    @property
+    def most_recent_timestamp(self) -> datetime:
+        """Get the timestamp of the most recent post in the couplet"""
+        return max(self.first_post.created_at, self.second_post.created_at)
 
 def get_last_phoneme(word):
     """Get the last phoneme sequence for a word."""
     if word.lower() not in pronouncing_dict:
         return None
-    # Get the first pronunciation (most common)
     pronunciation = pronouncing_dict[word.lower()][0]
-    # Find the last stressed vowel and return everything after it
     for i, phoneme in enumerate(reversed(pronunciation)):
         if any(char.isdigit() for char in phoneme):
             return tuple(pronunciation[-i-1:])
@@ -74,7 +86,6 @@ def do_words_rhyme(word1, word2):
 
 def get_last_word(text):
     """Get the last word from a line of text."""
-    text = numerals_to_words(text)
     text = re.sub(r'[^A-Za-z\s\']', '', text.lower())
     words = text.split()
     return words[-1] if words else None
@@ -88,6 +99,9 @@ class IambicRhymeFinder:
             'host': 'localhost',
             'port': 5432
         }
+        self.client = Client()
+        # Login using environment variables
+        self.client.login(os.getenv('BSKY_HANDLE'), os.getenv('BSKY_PASSWORD'))
 
     @contextmanager
     def get_connection(self):
@@ -104,7 +118,7 @@ class IambicRhymeFinder:
             if conn:
                 conn.close()
 
-    def get_last_repost_timestamp(self):
+    def get_last_repost_timestamp(self) -> datetime:
         """Get the timestamp of the most recent reposted message."""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
@@ -119,63 +133,132 @@ class IambicRhymeFinder:
                 result = cur.fetchone()
                 return result[0] if result else datetime.min
 
-    def get_new_messages(self, last_timestamp):
-        """Get all messages since the last reposted timestamp."""
+    def get_new_messages(self, last_timestamp: datetime) -> Iterator[BlueskyPost]:
+        """Get all messages since the last reposted timestamp as BlueskyPost objects."""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 query = """
-                    SELECT id, message_id, post_text, created_at
+                    SELECT id, message_id, post_text, created_at, did
                     FROM iambic_messages
                     WHERE created_at > %s
                     ORDER BY created_at ASC
                 """
                 cur.execute(query, (last_timestamp,))
-                return cur.fetchall()
+                for row in cur.fetchall():
+                    yield BlueskyPost(
+                        id=row[0],
+                        message_id=row[1],
+                        post_text=row[2],
+                        created_at=row[3],
+                        did=row[4]
+                    )
 
-    def find_rhyming_couplets(self):
+    def is_valid_post(self, post: models.AppBskyFeedDefs.PostView) -> bool:
+        """
+        Check if a post is valid for our purposes:
+        - Not a repost
+        - No images
+        - Not deleted
+        - No mentions
+        - No link cards
+        - No links in text
+        """
+        logging.info(post.indexed_at)
+        logging.info(post.record.created_at)
+        # if created at at indexed at are more than 1 day apart in either direction, skip (they are strs like 2024-11-19T17:46:18.552Z)
+        indexed_at_unix_timestamp = datetime.strptime(post.indexed_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+        created_at_unix_timestamp = datetime.strptime(post.record.created_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+        if abs(indexed_at_unix_timestamp - created_at_unix_timestamp) > 86400:
+            return False
+        if post.embed != None:
+            return False
+        
+        return True
+
+    def fetch_valid_posts(self, posts: List[BlueskyPost]) -> List[BlueskyPost]:
+        """Fetch and validate posts from Bluesky API"""
+        valid_posts = []
+        batch_size = 25
+        
+        # Create URI to post mapping
+        uri_to_post = {post.uri: post for post in posts}
+        uris = list(uri_to_post.keys())
+        
+        for i in range(0, len(uris), batch_size):
+            batch_uris = uris[i:i + batch_size]
+            try:
+                api_posts = self.client.app.bsky.feed.get_posts({'uris': batch_uris})
+                
+                for api_post in api_posts.posts:
+                    if self.is_valid_post(api_post):
+                        if api_post.uri in uri_to_post:
+                            valid_posts.append(uri_to_post[api_post.uri])
+                    else:
+                        logging.info(f"Filtered out post {api_post.uri}")
+                        
+            except Exception as e:
+                logging.error(f"Error fetching batch of posts: {e}")
+                continue
+                
+        return valid_posts
+
+    def find_rhyming_couplets(self) -> List[RhymingCouplet]:
         """Main function to find rhyming couplets."""
         # Get the last repost timestamp
         last_timestamp = self.get_last_repost_timestamp()
         logging.info(f"Last repost timestamp: {last_timestamp}")
 
         # Get all new messages
-        messages = self.get_new_messages(last_timestamp)
+        messages = list(self.get_new_messages(last_timestamp))
         logging.info(f"Found {len(messages)} new messages to analyze")
 
-        # Group messages by their end rhyme
-        rhyme_groups = defaultdict(list)
-        
-        for msg_id, message_id, text, created_at in messages:
-            last_word = get_last_word(text)
-            if last_word:
-                last_phoneme = get_last_phoneme(last_word)
-                if last_phoneme:
-                    rhyme_groups[last_phoneme].append((msg_id, message_id, text, created_at))
+        # Fetch and validate posts
+        valid_messages = self.fetch_valid_posts(messages)
+        logging.info(f"After filtering, {len(valid_messages)} valid messages remain")
 
         # Find rhyming couplets
         couplets = []
-        for rhyme_group in rhyme_groups.values():
-            if len(rhyme_group) < 2:
+        for i, post1 in enumerate(valid_messages):
+            word1 = post1.last_word
+            if not word1:
                 continue
                 
-            for msg1, msg2 in itertools.combinations(rhyme_group, 2):
-                # Check if the messages are temporally close (within 24 hours)
-                if abs((msg1[3] - msg2[3]).total_seconds()) <= 86400:
-                    couplets.append((msg1, msg2))
-
-        # Sort couplets by timestamp
-        couplets.sort(key=lambda x: min(x[0][3], x[1][3]))
+            for post2 in valid_messages[i+1:]:
+                word2 = post2.last_word
+                if not word2:
+                    continue
+                    
+                # Check if words rhyme and messages are within 24 hours
+                if (do_words_rhyme(word1, word2) and 
+                    abs((post1.created_at - post2.created_at).total_seconds()) <= 86400):
+                    couplets.append(RhymingCouplet(post1, post2))
 
         return couplets
+    
+    def find_oldest_recent_couplet(self, couplets: List[RhymingCouplet]) -> Optional[RhymingCouplet]:
+        """Find the couplet whose most recent post is the oldest among all couplets."""
+        if not couplets:
+            return None
+            
+        return min(couplets, key=lambda x: x.most_recent_timestamp)
 
 if __name__ == "__main__":
     finder = IambicRhymeFinder()
     couplets = finder.find_rhyming_couplets()
     
     print(f"\nFound {len(couplets)} potential rhyming couplets:")
-    for (id1, msg_id1, text1, time1), (id2, msg_id2, text2, time2) in couplets:
+    for couplet in couplets:
         print("\nCouplet:")
-        print(f"1: {text1}")
-        print(f"2: {text2}")
-        print(f"Posted: {time1} and {time2}")
-        print(f"Message IDs: {msg_id1} and {msg_id2}")
+        print(f"1: {couplet.first_post.post_text}")
+        print(f"2: {couplet.second_post.post_text}")
+        print(f"Posted: {couplet.first_post.created_at} and {couplet.second_post.created_at}")
+        print(f"Message IDs: {couplet.first_post.message_id} and {couplet.second_post.message_id}")
+    
+    # Find and print the oldest recent couplet
+    oldest_recent_couplet = finder.find_oldest_recent_couplet(couplets)
+    if oldest_recent_couplet:
+        print("\nCouplet with oldest most recent post:")
+        print(f"1: {oldest_recent_couplet.first_post.post_text}")
+        print(f"2: {oldest_recent_couplet.second_post.post_text}")
+        print(f"Posted: {oldest_recent_couplet.first_post.created_at} and {oldest_recent_couplet.second_post.created_at}")
+        print(f"Message IDs: {oldest_recent_couplet.first_post.message_id} and {oldest_recent_couplet.second_post.message_id}")
