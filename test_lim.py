@@ -67,6 +67,31 @@ def is_iambic_pentameter(pattern):
         for i, s in enumerate(pattern)
     )
 
+def is_anapestic_trimeter(pattern):
+    """
+    Check if a stress pattern is anapestic trimeter, allowing for one mismatch.
+    Anapestic trimeter should follow the pattern: 112112112 (where 2 is stressed).
+    Returns True if the pattern matches with at most one deviation.
+    
+    Args:
+        pattern: List of integers where 1 represents unstressed and 2 represents stressed syllables
+        
+    Returns:
+        bool: True if pattern is anapestic trimeter (allowing one mismatch), False otherwise
+    """
+   
+        
+    def get_expected_stress(position):
+        """Return expected stress level (1 or 2) for given position in anapestic trimeter."""
+        return 2 if position % 3 == 0 else 1
+    
+    mismatches = sum(
+        actual != get_expected_stress(i)
+        for i, actual in enumerate(pattern)
+    )
+    
+    return mismatches <= 1
+
 substitutions = {
     '&': ' and ',
     'w/': 'with',
@@ -106,6 +131,7 @@ def numerals_to_words(text):
 
 @lru_cache(maxsize=10000)
 def check_iambic_pentameter(text):
+    text = "Who carried his food in a bucket"
     """Optimized check for iambic pentameter."""
     # Quick length check before doing more work
     if len(text.split()) < 5 or len(text.split()) > 75:
@@ -132,19 +158,22 @@ def check_iambic_pentameter(text):
         return False
     
     stress_options = [word_stress_patterns[word] for word in words]
-    stress_options = [[s[0]] for s in stress_options]
+    #stress_options = [[s[0]] for s in stress_options]
+    #raise Exception(stress_options)
     
     if sum(len(p) > 1 for p in stress_options) > 3:
         return False    
     
     min_syllables = sum(min(len(patterns) for patterns in p) for p in stress_options)
     max_syllables = sum(max(len(patterns) for patterns in p) for p in stress_options)
-    if min_syllables > 10 or max_syllables < 10:
+    if min_syllables > 10 or max_syllables < 6:
         return False
     
     for stress_combination in itertools.product(*stress_options):
         pattern = [s for stresses in stress_combination for s in stresses]
-        if is_iambic_pentameter(pattern):
+        if is_anapestic_trimeter(pattern):
+            print (pattern)
+            print (text)
             return True
     return False
 
