@@ -20,6 +20,9 @@ from functools import lru_cache
 
 # Load NLTK's CMU Pronouncing Dictionary
 pronouncing_dict = cmudict.dict()
+# overwrite "a" to be pronounced as "ah" instead of "ey"
+pronouncing_dict["a"] = [["AH0"]]
+pronouncing_dict["perfect"] = [["P", "ER1", "F", "IH0", "K", "T"]]
 
 # Precompute stress patterns for each word
 word_stress_patterns = defaultdict(list)
@@ -63,16 +66,22 @@ def is_iambic_pentameter(pattern):
 # Main function to check if text is in iambic pentameter
 @lru_cache(maxsize=1000)
 def check_iambic_pentameter(raw_text):
+    if '\n' in raw_text:
+        print("Not iambic as contained linebreak")
+        return False
     text = normalize_text(raw_text)
     words = text.split()
+
+
     
     if not words or any(word not in word_stress_patterns for word in words):
+        print("Not iambic due to unexpected word")
         return False
     
     stress_combinations = [word_stress_patterns[word] for word in words]
     all_stress = product(*stress_combinations)
 
-   
+    
     found_iambic = False
     patterns_checked = 0
     for combination in all_stress:
@@ -85,6 +94,7 @@ def check_iambic_pentameter(raw_text):
 
     # if checked too many patterns, return False
     if patterns_checked > 24:
+        print("not iambic as too many patterns")
         return False
     return found_iambic
 
@@ -150,18 +160,40 @@ def get_last_phoneme(word):
             return tuple(pronunciation[-i-1:])
     return tuple(pronunciation)
 
+def get_all_phoneme_endings(word):
+    """Get all possible ending phoneme sequences for a word."""
+    if word.lower() not in pronouncing_dict:
+        return []
+    endings = []
+    for pronunciation in pronouncing_dict[word.lower()]:
+        for i, phoneme in enumerate(reversed(pronunciation)):
+            if any(char.isdigit() for char in phoneme):
+                endings.append(tuple(pronunciation[-i-1:]))
+                break
+        else:
+            endings.append(tuple(pronunciation))
+    return endings
+
 def do_words_rhyme(word1, word2):
-    """Check if two words rhyme."""
+    """Check if two words rhyme, considering all possible pronunciations."""
     if word1.lower() == word2.lower():
         return False
     
-    phoneme1 = get_last_phoneme(word1)
-    phoneme2 = get_last_phoneme(word2)
+    phoneme_endings1 = get_all_phoneme_endings(word1)
+    phoneme_endings2 = get_all_phoneme_endings(word2)
     
-    if not phoneme1 or not phoneme2:
+    
+    if not phoneme_endings1 or not phoneme_endings2:
+        print("no phoneme endings for", word1, word2)
         return False
-        
-    return phoneme1 == phoneme2
+    
+    # if either has multiple possible endings, then it is ambiguous and we should return False
+    if len(phoneme_endings1) > 1 or len(phoneme_endings2) > 1:
+        print("ambiguous endings for", word1, word2)
+        return False
+    # if the endings are the same, then they rhyme
+    if phoneme_endings1[0] == phoneme_endings2[0]:
+        return True
 
 def get_last_word(text):
     """Get the last word from a line of text."""
@@ -225,7 +257,7 @@ class IambicRhymeFinder:
                 cur.execute(query, (post.id,))
                 conn.commit()
                 print(f"Updated repost timestamp for post {post.uri}")
-               
+                
     def repost_post(self, post: BlueskyPost):
         """Repost a single post and update its timestamp."""
         try:
@@ -244,7 +276,7 @@ class IambicRhymeFinder:
         """Repost both posts in chronological order."""
         # Get posts in chronological order
         posts = sorted([couplet.first_post, couplet.second_post], 
-                      key=lambda x: x.created_at)
+                        key=lambda x: x.created_at)
         
         # Repost older post first
         self.repost_post(posts[0])
@@ -256,7 +288,7 @@ class IambicRhymeFinder:
         """Get all messages since the last reposted timestamp as BlueskyPost objects."""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
-               
+                
                 query = """
                     SELECT id, message_id, post_text, created_at, did
                     FROM iambic_messages
@@ -283,18 +315,34 @@ class IambicRhymeFinder:
         - No mentions
         - No link cards
         - No links in text
+        - Not a reply
         """
         try:
             logging.info(post.indexed_at)
             logging.info(post.record.created_at)
             # if created at at indexed at are more than 1 day apart in either direction, skip
-            indexed_at_unix_timestamp = datetime.strptime(post.indexed_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
-            created_at_unix_timestamp = datetime.strptime(post.record.created_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
-            if abs(indexed_at_unix_timestamp - created_at_unix_timestamp) > 86400:
-                return False
-            if post.embed != None:
+            logging.info(post.record)
+            #indexed_at_unix_timestamp = datetime.strptime(post.indexed_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+            #created_at_unix_timestamp = datetime.strptime(post.record.created_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+            
+            
+            # if created before 2024, reject
+            # year is first 4 chars of created_at
+            year = post.record.created_at[0:4]
+            if int(year)<2024:
+                print("discarding as year not 2024")
                 return False
             
+            if post.embed is not None:
+                print("disarding as had embed")
+                return False
+            
+    
+            if post.record.reply:
+                print("Reply")
+                return False
+            print("Not a reply")
+        
             return True
         except Exception as e:
             logging.error(f"Error validating post: {e}")
@@ -352,6 +400,7 @@ class IambicRhymeFinder:
         logging.info(f"After filtering, {len(valid_messages)} valid messages remain")
         for message in valid_messages:
             logging.info(f"Valid message: {message.post_text}")
+           # logging.info(f"{message.record.created_at}")
 
         # Find rhyming couplets
         couplets = []
@@ -365,9 +414,7 @@ class IambicRhymeFinder:
                 if not word2:
                     continue
                     
-                # Check if words rhyme and messages are within 24 hours
-                if (do_words_rhyme(word1, word2) and 
-                    abs((post1.created_at - post2.created_at).total_seconds()) <= 86400):
+                if (do_words_rhyme(word1, word2) ):
                     couplets.append(RhymingCouplet(post1, post2))
 
         return couplets
@@ -399,7 +446,7 @@ if __name__ == "__main__":
         print(f"2: {oldest_recent_couplet.second_post.post_text}")
         print(f"Posted: {oldest_recent_couplet.first_post.created_at} and {oldest_recent_couplet.second_post.created_at}")
         print(f"Message IDs: {oldest_recent_couplet.first_post.message_id} and {oldest_recent_couplet.second_post.message_id}")
-        #raise Exception("Test")
+        # raise Exception("Test")
         # Repost the couplet in chronological order
         try:
             finder.repost_couplet(oldest_recent_couplet)

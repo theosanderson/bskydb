@@ -337,6 +337,9 @@ data:
     # Download required NLTK data
     nltk.download('cmudict', quiet=True)
     pronouncing_dict = cmudict.dict()
+    pronouncing_dict["a"] = [["AH0"]]
+    #overwrite "perfect" to have the correct pronunciation
+    pronouncing_dict["perfect"] = [["P", "ER1", "F", "IH0", "K", "T"]]
 
     # Create word stress patterns cache
     word_stress_patterns = defaultdict(list)
@@ -734,11 +737,12 @@ data:
     # Main function to check if text is in iambic pentameter
     @lru_cache(maxsize=1000)
     def check_iambic_pentameter(raw_text):
+        if '\n' in raw_text:
+            return False
         text = normalize_text(raw_text)
         words = text.split()
 
-        if '\n' in text:
-            return False
+
         
         if not words or any(word not in word_stress_patterns for word in words):
             return False
@@ -823,19 +827,51 @@ data:
             if any(char.isdigit() for char in phoneme):
                 return tuple(pronunciation[-i-1:])
         return tuple(pronunciation)
+    def get_final_syllable(word):
+        """Get the final syllable of a word."""
+        if word.lower() not in pronouncing_dict:
+            return None
+        pronunciation = pronouncing_dict[word.lower()][0]
+        for i, phoneme in enumerate(reversed(pronunciation)):
+            if any(char.isdigit() for char in phoneme):
+                return tuple(pronunciation[-i-2:])
+        return tuple(pronunciation)
+
+    def get_all_phoneme_endings(word):
+        """Get all possible ending phoneme sequences for a word."""
+        if word.lower() not in pronouncing_dict:
+            return []
+        endings = []
+        for pronunciation in pronouncing_dict[word.lower()]:
+            for i, phoneme in enumerate(reversed(pronunciation)):
+                if any(char.isdigit() for char in phoneme):
+                    endings.append(tuple(pronunciation[-i-1:]))
+                    break
+            else:
+                endings.append(tuple(pronunciation))
+        # deduplicate and sort
+        endings = sorted(set(endings))
+        return endings
 
     def do_words_rhyme(word1, word2):
-        """Check if two words rhyme."""
+        """Check if two words rhyme, considering all possible pronunciations."""
         if word1.lower() == word2.lower():
             return False
         
-        phoneme1 = get_last_phoneme(word1)
-        phoneme2 = get_last_phoneme(word2)
+        phoneme_endings1 = get_all_phoneme_endings(word1)
+        phoneme_endings2 = get_all_phoneme_endings(word2)
         
-        if not phoneme1 or not phoneme2:
+        if not phoneme_endings1 or not phoneme_endings2:
             return False
-            
-        return phoneme1 == phoneme2
+        
+        # if either has multiple possible endings, then it is ambiguous and we should return False
+        if len(phoneme_endings1) > 1 or len(phoneme_endings2) > 1:
+            return False
+        if get_last_phoneme(word1) == get_last_phoneme(word2):
+            return False
+        # if the endings are the same, then they rhyme
+        if phoneme_endings1[0] == phoneme_endings2[0]:
+            return True
 
     def get_last_word(text):
         """Get the last word from a line of text."""
@@ -957,22 +993,39 @@ data:
             - No mentions
             - No link cards
             - No links in text
+            - Not a reply
             """
             try:
                 logging.info(post.indexed_at)
                 logging.info(post.record.created_at)
                 # if created at at indexed at are more than 1 day apart in either direction, skip
-                indexed_at_unix_timestamp = datetime.strptime(post.indexed_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
-                created_at_unix_timestamp = datetime.strptime(post.record.created_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
-                if abs(indexed_at_unix_timestamp - created_at_unix_timestamp) > 86400:
-                    return False
-                if post.embed != None:
+                logging.info(post.record)
+                #indexed_at_unix_timestamp = datetime.strptime(post.indexed_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+                #created_at_unix_timestamp = datetime.strptime(post.record.created_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+                
+                
+                # if created before 2024, reject
+                # year is first 4 chars of created_at
+                year = post.record.created_at[0:4]
+                if int(year)<2024:
+                    print("discarding as year not 2024")
                     return False
                 
+                if post.embed is not None:
+                    print("disarding as had embed")
+                    return False
+                
+        
+                if post.record.reply:
+                    print("Reply")
+                    return False
+                print("Not a reply")
+            
                 return True
             except Exception as e:
                 logging.error(f"Error validating post: {e}")
                 return False
+
 
         def fetch_valid_posts(self, posts: List[BlueskyPost]) -> List[BlueskyPost]:
             """Fetch and validate posts from Bluesky API"""
