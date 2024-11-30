@@ -694,6 +694,9 @@ data:
 
     # Load NLTK's CMU Pronouncing Dictionary
     pronouncing_dict = cmudict.dict()
+    # overwrite "a" to be pronounced as "ah" instead of "ey"
+    pronouncing_dict["a"] = [["AH0"]]
+    pronouncing_dict["perfect"] = [["P", "ER1", "F", "IH0", "K", "T"]]
 
     # Precompute stress patterns for each word
     word_stress_patterns = defaultdict(list)
@@ -738,6 +741,7 @@ data:
     @lru_cache(maxsize=1000)
     def check_iambic_pentameter(raw_text):
         if '\n' in raw_text:
+            print("Not iambic as contained linebreak")
             return False
         text = normalize_text(raw_text)
         words = text.split()
@@ -745,12 +749,13 @@ data:
 
         
         if not words or any(word not in word_stress_patterns for word in words):
+            print("Not iambic due to unexpected word")
             return False
         
         stress_combinations = [word_stress_patterns[word] for word in words]
         all_stress = product(*stress_combinations)
 
-      
+        
         found_iambic = False
         patterns_checked = 0
         for combination in all_stress:
@@ -763,6 +768,7 @@ data:
 
         # if checked too many patterns, return False
         if patterns_checked > 24:
+            print("not iambic as too many patterns")
             return False
         return found_iambic
 
@@ -827,15 +833,6 @@ data:
             if any(char.isdigit() for char in phoneme):
                 return tuple(pronunciation[-i-1:])
         return tuple(pronunciation)
-    def get_final_syllable(word):
-        """Get the final syllable of a word."""
-        if word.lower() not in pronouncing_dict:
-            return None
-        pronunciation = pronouncing_dict[word.lower()][0]
-        for i, phoneme in enumerate(reversed(pronunciation)):
-            if any(char.isdigit() for char in phoneme):
-                return tuple(pronunciation[-i-2:])
-        return tuple(pronunciation)
 
     def get_all_phoneme_endings(word):
         """Get all possible ending phoneme sequences for a word."""
@@ -849,8 +846,6 @@ data:
                     break
             else:
                 endings.append(tuple(pronunciation))
-        # deduplicate and sort
-        endings = sorted(set(endings))
         return endings
 
     def do_words_rhyme(word1, word2):
@@ -861,13 +856,14 @@ data:
         phoneme_endings1 = get_all_phoneme_endings(word1)
         phoneme_endings2 = get_all_phoneme_endings(word2)
         
+        
         if not phoneme_endings1 or not phoneme_endings2:
+            print("no phoneme endings for", word1, word2)
             return False
         
         # if either has multiple possible endings, then it is ambiguous and we should return False
         if len(phoneme_endings1) > 1 or len(phoneme_endings2) > 1:
-            return False
-        if get_last_phoneme(word1) == get_last_phoneme(word2):
+            print("ambiguous endings for", word1, word2)
             return False
         # if the endings are the same, then they rhyme
         if phoneme_endings1[0] == phoneme_endings2[0]:
@@ -935,7 +931,7 @@ data:
                     cur.execute(query, (post.id,))
                     conn.commit()
                     print(f"Updated repost timestamp for post {post.uri}")
-                  
+                    
         def repost_post(self, post: BlueskyPost):
             """Repost a single post and update its timestamp."""
             try:
@@ -954,7 +950,7 @@ data:
             """Repost both posts in chronological order."""
             # Get posts in chronological order
             posts = sorted([couplet.first_post, couplet.second_post], 
-                          key=lambda x: x.created_at)
+                            key=lambda x: x.created_at)
             
             # Repost older post first
             self.repost_post(posts[0])
@@ -966,7 +962,7 @@ data:
             """Get all messages since the last reposted timestamp as BlueskyPost objects."""
             with self.get_connection() as conn:
                 with conn.cursor() as cur:
-                  
+                    
                     query = """
                         SELECT id, message_id, post_text, created_at, did
                         FROM iambic_messages
@@ -1026,7 +1022,6 @@ data:
                 logging.error(f"Error validating post: {e}")
                 return False
 
-
         def fetch_valid_posts(self, posts: List[BlueskyPost]) -> List[BlueskyPost]:
             """Fetch and validate posts from Bluesky API"""
             valid_posts = []
@@ -1079,6 +1074,7 @@ data:
             logging.info(f"After filtering, {len(valid_messages)} valid messages remain")
             for message in valid_messages:
                 logging.info(f"Valid message: {message.post_text}")
+              # logging.info(f"{message.record.created_at}")
 
             # Find rhyming couplets
             couplets = []
@@ -1092,9 +1088,7 @@ data:
                     if not word2:
                         continue
                         
-                    # Check if words rhyme and messages are within 24 hours
-                    if (do_words_rhyme(word1, word2) and 
-                        abs((post1.created_at - post2.created_at).total_seconds()) <= 86400):
+                    if (do_words_rhyme(word1, word2) ):
                         couplets.append(RhymingCouplet(post1, post2))
 
             return couplets
@@ -1126,7 +1120,7 @@ data:
             print(f"2: {oldest_recent_couplet.second_post.post_text}")
             print(f"Posted: {oldest_recent_couplet.first_post.created_at} and {oldest_recent_couplet.second_post.created_at}")
             print(f"Message IDs: {oldest_recent_couplet.first_post.message_id} and {oldest_recent_couplet.second_post.message_id}")
-            #raise Exception("Test")
+            # raise Exception("Test")
             # Repost the couplet in chronological order
             try:
                 finder.repost_couplet(oldest_recent_couplet)
