@@ -723,7 +723,7 @@ data:
 
     # Normalize text
     def normalize_text(text):
-        substitutions = {'&': ' and ', 'w/': 'with', 'w/o': 'without'}
+        substitutions = {'&': ' and ', 'w/': 'with', 'w/o': 'without', '.' : ' . '}
         for k, v in substitutions.items():
             text = text.replace(k, v)
         text = re.sub(r'\d+', lambda m: num2words(int(m.group())), text)
