@@ -888,6 +888,52 @@ data:
             # Login using environment variables
             self.client.login(os.getenv('BSKY_HANDLE'), os.getenv('BSKY_PASSWORD'))
 
+
+        def get_last_posted_couplet(self) -> Optional[RhymingCouplet]:
+            """Get the most recently posted couplet."""
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    query = """
+                        SELECT id, message_id, post_text, created_at, did
+                        FROM iambic_messages
+                        WHERE reposted_at IS NOT NULL
+                        ORDER BY reposted_at DESC
+                        LIMIT 2
+                    """
+                    cur.execute(query)
+                    rows = cur.fetchall()
+                    
+                    if len(rows) < 2:
+                        return None
+                    
+                    # Create BlueskyPost objects for the two posts
+                    posts = [
+                        BlueskyPost(
+                            id=row[0],
+                            message_id=row[1],
+                            post_text=row[2],
+                            created_at=row[3],
+                            did=row[4],
+                            reposted_at=row[5] if len(row) > 5 else None
+                        )
+                        for row in rows
+                    ]
+                    
+                    return RhymingCouplet(posts[0], posts[1])
+
+        def do_couplets_rhyme(self, couplet1: RhymingCouplet, couplet2: RhymingCouplet) -> bool:
+            """Check if two couplets rhyme with each other."""
+            # Get last words of all posts
+            words1 = [couplet1.first_post.last_word, couplet1.second_post.last_word]
+            words2 = [couplet2.first_post.last_word, couplet2.second_post.last_word]
+            
+            # Check if any word from first couplet rhymes with any word from second couplet
+            for word1 in words1:
+                for word2 in words2:
+                    if word1 and word2 and do_words_rhyme(word1, word2):
+                        return True
+            return False
+
         @contextmanager
         def get_connection(self):
             """Context manager for database connections."""
@@ -1097,8 +1143,12 @@ data:
             """Find the couplet whose most recent post is the oldest among all couplets."""
             if not couplets:
                 return None
+            last_couplet = self.get_last_posted_couplet()
+            filtered_couplets = [c for c in couplets if not self.do_couplets_rhyme(c, last_couplet)]
+            if not filtered_couplets:
+                return None
                 
-            return min(couplets, key=lambda x: x.most_recent_timestamp)
+            return min(filtered_couplets, key=lambda x: x.most_recent_timestamp)
 
     if __name__ == "__main__":
         finder = IambicRhymeFinder()
